@@ -1,0 +1,6 @@
+[server]
+# Streamlit's own upload cap (MB). Keep it >= MAX_UPLOAD_MB in your .env.
+maxUploadSize = 10
+
+[browser]
+gatherUsageStats = false
