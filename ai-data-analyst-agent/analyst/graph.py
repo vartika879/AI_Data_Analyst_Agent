@@ -1,7 +1,11 @@
-"""LangGraph workflow: Planner -> Executor -> Critic -> [Reviewer] -> Reporter -> [Narrator].
+"""LangGraph workflow:
+[Clarifier] -> Planner -> Executor -> Critic -> [Reviewer] -> Reporter -> [Narrator].
 
 Flow:
-    START -> planner -> executor -> critic -> (reviewer) -> reporter -> (narrator) -> END
+    START -> (clarifier) -> planner -> executor -> critic -> (reviewer)
+          -> reporter -> (narrator) -> END
+The Clarifier may stop the run early with status "clarify": the UI then asks the
+user a question and starts a NEW run (without the Clarifier) with the answer.
 A recoverable error (bad plan, plan does not fit the data) goes to `repair`,
 which sends the problem back to the planner. The Reviewer can also request a
 repair when it judges the result is a "mismatch". All repairs share ONE budget:
@@ -16,12 +20,13 @@ import pandas as pd
 from langgraph.graph import END, START, StateGraph
 from typing_extensions import TypedDict
 
+from analyst.clarifier import ClarificationError, ClarifierDecision, decide_clarification  # NEW (Phase 12)
 from analyst.critic import CriticReport, review_execution
 from analyst.executor import ExecutionError, ExecutionResult, execute_plan
 from analyst.llm import LLMClient, LLMError
-from analyst.narrator import MAX_ANSWER_CHARS, NarrationError, narrate_result  # NEW (Phase 11)
+from analyst.narrator import MAX_ANSWER_CHARS, NarrationError, narrate_result
 from analyst.plan_validation import PlanValidationError
-from analyst.planner import PlannerError, generate_plan
+from analyst.planner import MAX_QUESTION_CHARS, PlannerError, generate_plan
 from analyst.reporter import _escape as escape_markdown
 from analyst.reporter import build_report
 from analyst.reviewer import ReviewError, ReviewVerdict, review_result
@@ -31,19 +36,21 @@ MAX_REPAIR_ATTEMPTS = 1
 RECURSION_LIMIT = 25  # safety net only; the routing already bounds the loop
 MAX_MESSAGE_CHARS = 400
 
-Status = Literal["success", "unsupported", "failed"]
+Status = Literal["success", "unsupported", "failed", "clarify"]  # NEW (Phase 12): "clarify"
 
 
 class AnalysisState(TypedDict, total=False):
     question: str
     df: pd.DataFrame
+    clarification: ClarifierDecision | None  # NEW (Phase 12)
+    clarify_error: str | None  # NEW (Phase 12): why the clarifier was skipped
     plan: AnalysisPlan | None
     result: ExecutionResult | None
     critic: CriticReport | None
     review: ReviewVerdict | None
     review_error: str | None  # why the review was skipped
-    narrative: str | None  # NEW (Phase 11)
-    narrative_error: str | None  # NEW (Phase 11): why there is no AI summary
+    narrative: str | None
+    narrative_error: str | None  # why there is no AI summary
     error: str | None  # user-safe message
     error_detail: str | None  # text sent back to the LLM during repair
     error_kind: Literal["recoverable", "fatal"] | None
@@ -63,8 +70,12 @@ class AnalysisOutcome:
     repair_attempts: int = 0
     review: ReviewVerdict | None = None
     review_error: str | None = None
-    narrative: str | None = None  # NEW (Phase 11): optional AI summary, numbers checked
-    narrative_error: str | None = None  # NEW (Phase 11)
+    narrative: str | None = None  # optional AI summary, numbers checked
+    narrative_error: str | None = None
+    # NEW (Phase 12): raw (unescaped) so the UI can use the option text. The UI
+    # must escape it before showing it.
+    clarification: ClarifierDecision | None = None
+    clarify_error: str | None = None
 
 
 # ---------------------------------------------------------------- routing
@@ -78,6 +89,12 @@ def _next_after_error_check(state: AnalysisState, ok_node: str) -> str:
     if kind == "recoverable" and state.get("repair_attempts", 0) < MAX_REPAIR_ATTEMPTS:
         return "repair"
     return "fail"
+
+
+def route_after_clarifier(state: AnalysisState) -> str:  # NEW (Phase 12)
+    if state.get("status") == "clarify":
+        return END
+    return "planner"
 
 
 def route_after_planner(state: AnalysisState) -> str:
@@ -132,13 +149,32 @@ def fail_node(state: AnalysisState) -> dict:
 def build_graph(
     client: LLMClient,
     reviewer_client: LLMClient | None = None,
-    narrator_client: LLMClient | None = None,  # NEW (Phase 11)
+    narrator_client: LLMClient | None = None,
+    clarifier_client: LLMClient | None = None,  # NEW (Phase 12)
 ):
     """Build and compile the workflow. LLM clients are injected (testable).
 
-    reviewer_client=None means no Reviewer node; narrator_client=None means no
-    Narrator node.
+    A client of None means that agent's node is not part of the graph at all.
     """
+
+    def clarifier_node(state: AnalysisState) -> dict:  # NEW (Phase 12)
+        question = state["question"].strip()
+        if not question or len(question) > MAX_QUESTION_CHARS:
+            # The planner reports these problems with a clearer message.
+            return {"clarify_error": None}
+        try:
+            decision = decide_clarification(question, state["df"], clarifier_client)
+        except (LLMError, ClarificationError) as exc:
+            # Fail open: a broken Clarifier must never block the question.
+            return {"clarify_error": str(exc)}
+        if decision.action != "ask":
+            return {"clarify_error": None}
+        return {
+            "clarification": decision,
+            "clarify_error": None,
+            "status": "clarify",
+            "message": escape_markdown(decision.question or "", MAX_MESSAGE_CHARS),
+        }
 
     def planner_node(state: AnalysisState) -> dict:
         try:
@@ -211,7 +247,7 @@ def build_graph(
         text = build_report(state["plan"], state["result"], state["critic"])
         return {"status": "success", "message": text}
 
-    def narrator_node(state: AnalysisState) -> dict:  # NEW (Phase 11)
+    def narrator_node(state: AnalysisState) -> dict:
         review = state.get("review")
         if review is not None and review.verdict == "mismatch":
             return {
@@ -235,7 +271,13 @@ def build_graph(
     graph.add_node("repair", prepare_repair)
     graph.add_node("fail", fail_node)
 
-    graph.add_edge(START, "planner")
+    if clarifier_client is None:  # NEW (Phase 12)
+        graph.add_edge(START, "planner")
+    else:
+        graph.add_node("clarifier", clarifier_node)
+        graph.add_edge(START, "clarifier")
+        graph.add_conditional_edges("clarifier", route_after_clarifier, ["planner", END])
+
     graph.add_conditional_edges("planner", route_after_planner, ["executor", "repair", "fail", END])
     graph.add_conditional_edges("executor", route_after_executor, ["critic", "repair", "fail"])
 
@@ -249,8 +291,8 @@ def build_graph(
         )
         graph.add_conditional_edges("reviewer", route_after_reviewer, ["reporter", "repair"])
 
-    graph.add_edge("repair", "planner")
-    if narrator_client is None:  # NEW (Phase 11)
+    graph.add_edge("repair", "planner")  # repairs never go back through the Clarifier
+    if narrator_client is None:
         graph.add_edge("reporter", END)
     else:
         graph.add_node("narrator", narrator_node)
@@ -265,12 +307,13 @@ def run_analysis(
     df: pd.DataFrame,
     client: LLMClient,
     reviewer_client: LLMClient | None = None,
-    narrator_client: LLMClient | None = None,  # NEW (Phase 11)
+    narrator_client: LLMClient | None = None,
+    clarifier_client: LLMClient | None = None,  # NEW (Phase 12)
 ) -> AnalysisOutcome:
     """Run the whole workflow. Never raises: failures become status='failed'."""
     initial: AnalysisState = {"question": question, "df": df, "repair_attempts": 0}
     try:
-        final = build_graph(client, reviewer_client, narrator_client).invoke(
+        final = build_graph(client, reviewer_client, narrator_client, clarifier_client).invoke(
             initial, config={"recursion_limit": RECURSION_LIMIT}
         )
     except Exception as exc:  # last-resort boundary; only the type is shown
@@ -284,7 +327,7 @@ def run_analysis(
         review = review.model_copy(
             update={"reason": escape_markdown(review.reason, MAX_MESSAGE_CHARS)}
         )
-    narrative = final.get("narrative")  # NEW (Phase 11): LLM text, so escape it too
+    narrative = final.get("narrative")  # LLM text, so escape it too
     if narrative is not None:
         narrative = escape_markdown(narrative, MAX_ANSWER_CHARS)
     narrative_error = final.get("narrative_error")
@@ -301,4 +344,6 @@ def run_analysis(
         review_error=final.get("review_error"),
         narrative=narrative,
         narrative_error=narrative_error,
+        clarification=final.get("clarification"),
+        clarify_error=final.get("clarify_error"),
     )

@@ -92,3 +92,24 @@ def test_narrator_can_be_disabled(value):
 def test_invalid_narrator_flag_raises_config_error():
     with pytest.raises(ConfigError, match="ENABLE_NARRATOR"):
         load_settings({"ENABLE_NARRATOR": "maybe"})
+
+
+def test_clarifier_defaults():
+    settings = load_settings({"GROQ_MODEL": "main-model"})
+    assert settings.clarifier_enabled is True
+    assert settings.clarifier_model == "main-model"
+
+
+def test_clarifier_model_can_be_overridden():
+    settings = load_settings({"GROQ_MODEL": "main", "GROQ_CLARIFIER_MODEL": "small"})
+    assert settings.clarifier_model == "small"
+
+
+@pytest.mark.parametrize("value", ["false", "0", "no", "False"])
+def test_clarifier_can_be_disabled(value):
+    assert load_settings({"ENABLE_CLARIFIER": value}).clarifier_enabled is False
+
+
+def test_invalid_clarifier_flag_raises_config_error():
+    with pytest.raises(ConfigError, match="ENABLE_CLARIFIER"):
+        load_settings({"ENABLE_CLARIFIER": "maybe"})

@@ -24,12 +24,14 @@ class Settings:
     groq_api_key: str | None = field(default=None, repr=False)
     groq_model: str = DEFAULT_GROQ_MODEL
     max_upload_mb: float = DEFAULT_MAX_UPLOAD_MB
-    groq_reviewer_model: str | None = None  # NEW (Phase 10)
-    reviewer_enabled: bool = True  # NEW (Phase 10)
+    groq_reviewer_model: str | None = None  
+    reviewer_enabled: bool = True  
 
     # Phase 11: Narrator Agent
     groq_narrator_model: str | None = None
     narrator_enabled: bool = True
+    groq_clarifier_model: str | None = None  
+    clarifier_enabled: bool = True  
 
     @property
     def has_api_key(self) -> bool:
@@ -45,7 +47,9 @@ class Settings:
     @property
     def narrator_model(self) -> str:  # NEW (Phase 11)
         return self.groq_narrator_model or self.groq_model
-
+    @property
+    def clarifier_model(self) -> str:  # NEW (Phase 12)
+        return self.groq_clarifier_model or self.groq_model
 
 def _parse_max_upload_mb(raw: str | None) -> float:
     if raw is None or raw.strip() == "":
@@ -92,6 +96,7 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
     model = environ.get("GROQ_MODEL", "").strip() or DEFAULT_GROQ_MODEL
     reviewer_model = environ.get("GROQ_REVIEWER_MODEL", "").strip() or None
     narrator_model = environ.get("GROQ_NARRATOR_MODEL", "").strip() or None
+    clarifier_model = environ.get("GROQ_CLARIFIER_MODEL", "").strip() or None
     return Settings(
         groq_api_key=_clean_api_key(environ.get("GROQ_API_KEY")),
         groq_model=model,
@@ -100,4 +105,5 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
         reviewer_enabled=_parse_bool(environ.get("ENABLE_REVIEWER"), "ENABLE_REVIEWER", True),
         groq_narrator_model=narrator_model,
         narrator_enabled=_parse_bool(environ.get("ENABLE_NARRATOR"), "ENABLE_NARRATOR", True),
-    )
+        groq_clarifier_model=clarifier_model,
+        clarifier_enabled=_parse_bool(environ.get("ENABLE_CLARIFIER"), "ENABLE_CLARIFIER", True),)
