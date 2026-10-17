@@ -114,3 +114,23 @@ If the Narrator agent is on, it receives the same first 10 result rows. Set
 - The Planner can still misunderstand a question and produce a valid but
   wrong plan. Check the "How this was computed" panel.
 - No authentication, database or deployment setup.
+
+## Evaluation
+
+`evals/` has 24 questions on a fixed synthetic sales CSV. Expected answers are
+computed with plain Python (`csv`, `statistics`), not Pandas, and the pipeline's
+result table is compared with them. Plans are not compared, because many
+different plans can be correct.
+
+```powershell
+python -m evals.runner --configs baseline,full --repeats 3 --delay 3
+```
+
+This makes real Groq API calls. `baseline` is the Planner alone; `full` adds the
+Clarifier, Reviewer and Narrator. Results are saved to `evals/results/`
+(ignored by Git). The harness itself is tested without any API
+(`tests/test_evals.py`): every case has a reference plan that must pass its own
+check.
+
+Limits: one small synthetic dataset, so a difference of one or two cases is
+noise. LLM output is not fully repeatable even at temperature 0.
