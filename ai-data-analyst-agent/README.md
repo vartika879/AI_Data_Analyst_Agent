@@ -32,6 +32,10 @@ If the plan is rejected for a recoverable reason (unknown column, wrong value
 type, malformed LLM output), the problem is sent back to the Planner once.
 API failures and Critic failures are not retried.
 
+An optional **Narrator** (LLM) writes a short summary. Every number in it is
+checked against the result data; if any number cannot be traced, the summary is
+discarded and the template report is shown. Wording is not verified.
+
 ## Supported operations
 
 Column summary, filtering, sorting, grouping + aggregation (sum, mean, median,
@@ -96,6 +100,9 @@ If the Reviewer agent is on, it also sends the question, the plan and the
 **first 10 rows of the result** (40 characters per cell). The full file is not
 sent. Do not use sensitive data you are not allowed to share with that
 provider. Set `ENABLE_REVIEWER=false` to stop sending result rows.
+
+If the Narrator agent is on, it receives the same first 10 result rows. Set
+`ENABLE_NARRATOR=false` to stop that.
 
 ## Known limitations
 

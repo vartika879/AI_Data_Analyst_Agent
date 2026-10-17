@@ -31,12 +31,27 @@ with st.sidebar:
         st.write(f"Reviewer agent: on (`{settings.reviewer_model}`)")
     else:
         st.write("Reviewer agent: off")
+    if settings.narrator_enabled:
+        st.write(f"Narrator agent: on (`{settings.narrator_model}`)")
+    else:
+        st.write("Narrator agent: off")
 
 
 def render_outcome(outcome: AnalysisOutcome) -> None:
     if outcome.status == "success":
         st.subheader("Answer")
-        st.markdown(outcome.message)
+        if outcome.narrative:
+            st.markdown(outcome.narrative)
+            st.caption(
+                "AI-written summary. The numbers in it were checked against the "
+                "result table; the wording was not verified."
+            )
+            with st.expander("Computed details"):
+                st.markdown(outcome.message)
+        else:
+            st.markdown(outcome.message)
+            if outcome.narrative_error:
+                st.caption(f"AI summary unavailable: {outcome.narrative_error}")
         st.subheader("Result table")
         st.dataframe(outcome.result.table)
         chart = build_chart(outcome.plan, outcome.result)
@@ -122,12 +137,17 @@ if st.button("Analyze", type="primary"):
             if settings.reviewer_enabled
             else None
         )
+        narrator_client = (
+            GroqClient(settings.groq_api_key, settings.narrator_model)
+            if settings.narrator_enabled
+            else None
+        )
     except LLMError as exc:
         st.error(str(exc))
         st.stop()
 
     with st.spinner("Planning, running and checking..."):
-        outcome = run_analysis(question, df, client, reviewer_client)
+        outcome = run_analysis(question, df, client, reviewer_client, narrator_client)
     st.session_state["saved"] = {"question": question, "outcome": outcome}
 
 # Rendered from session_state, so the answer survives reruns (e.g. typing in a widget).

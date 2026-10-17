@@ -1,11 +1,12 @@
-"""LangGraph workflow: Planner -> Executor -> Critic -> [Reviewer] -> Reporter.
+"""LangGraph workflow: Planner -> Executor -> Critic -> [Reviewer] -> Reporter -> [Narrator].
 
 Flow:
-    START -> planner -> executor -> critic -> (reviewer) -> reporter -> END
+    START -> planner -> executor -> critic -> (reviewer) -> reporter -> (narrator) -> END
 A recoverable error (bad plan, plan does not fit the data) goes to `repair`,
 which sends the problem back to the planner. The Reviewer can also request a
 repair when it judges the result is a "mismatch". All repairs share ONE budget:
 MAX_REPAIR_ATTEMPTS. Fatal errors go straight to `fail`.
+The Narrator only adds an optional summary; it never changes `message`.
 """
 
 from dataclasses import dataclass
@@ -18,11 +19,12 @@ from typing_extensions import TypedDict
 from analyst.critic import CriticReport, review_execution
 from analyst.executor import ExecutionError, ExecutionResult, execute_plan
 from analyst.llm import LLMClient, LLMError
+from analyst.narrator import MAX_ANSWER_CHARS, NarrationError, narrate_result  # NEW (Phase 11)
 from analyst.plan_validation import PlanValidationError
 from analyst.planner import PlannerError, generate_plan
 from analyst.reporter import _escape as escape_markdown
 from analyst.reporter import build_report
-from analyst.reviewer import ReviewError, ReviewVerdict, review_result  # NEW (Phase 10)
+from analyst.reviewer import ReviewError, ReviewVerdict, review_result
 from analyst.schemas import AnalysisPlan
 
 MAX_REPAIR_ATTEMPTS = 1
@@ -38,8 +40,10 @@ class AnalysisState(TypedDict, total=False):
     plan: AnalysisPlan | None
     result: ExecutionResult | None
     critic: CriticReport | None
-    review: ReviewVerdict | None  # NEW (Phase 10)
-    review_error: str | None  # NEW (Phase 10): why the review was skipped
+    review: ReviewVerdict | None
+    review_error: str | None  # why the review was skipped
+    narrative: str | None  # NEW (Phase 11)
+    narrative_error: str | None  # NEW (Phase 11): why there is no AI summary
     error: str | None  # user-safe message
     error_detail: str | None  # text sent back to the LLM during repair
     error_kind: Literal["recoverable", "fatal"] | None
@@ -52,13 +56,15 @@ class AnalysisState(TypedDict, total=False):
 @dataclass(frozen=True, eq=False)
 class AnalysisOutcome:
     status: Status
-    message: str  # the answer (success) or a user-safe explanation
+    message: str  # the template report (success) or a user-safe explanation
     plan: AnalysisPlan | None = None
     result: ExecutionResult | None = None
     critic: CriticReport | None = None
     repair_attempts: int = 0
-    review: ReviewVerdict | None = None  # NEW (Phase 10)
-    review_error: str | None = None  # NEW (Phase 10)
+    review: ReviewVerdict | None = None
+    review_error: str | None = None
+    narrative: str | None = None  # NEW (Phase 11): optional AI summary, numbers checked
+    narrative_error: str | None = None  # NEW (Phase 11)
 
 
 # ---------------------------------------------------------------- routing
@@ -88,7 +94,7 @@ def route_after_critic(state: AnalysisState) -> str:
     return _next_after_error_check(state, "reporter")
 
 
-def route_after_reviewer(state: AnalysisState) -> str:  # NEW (Phase 10)
+def route_after_reviewer(state: AnalysisState) -> str:
     review = state.get("review")
     budget_left = state.get("repair_attempts", 0) < MAX_REPAIR_ATTEMPTS
     if review is not None and review.verdict == "mismatch" and budget_left:
@@ -109,9 +115,9 @@ def prepare_repair(state: AnalysisState) -> dict:
         "error_kind": None,
         "plan": None,
         "result": None,
-        "critic": None,  # NEW (Phase 10): stale after a repair
-        "review": None,  # NEW (Phase 10)
-        "review_error": None,  # NEW (Phase 10)
+        "critic": None,
+        "review": None,
+        "review_error": None,
     }
 
 
@@ -123,10 +129,15 @@ def fail_node(state: AnalysisState) -> dict:
     return {"status": "failed", "message": escape_markdown(text, MAX_MESSAGE_CHARS)}
 
 
-def build_graph(client: LLMClient, reviewer_client: LLMClient | None = None):
+def build_graph(
+    client: LLMClient,
+    reviewer_client: LLMClient | None = None,
+    narrator_client: LLMClient | None = None,  # NEW (Phase 11)
+):
     """Build and compile the workflow. LLM clients are injected (testable).
 
-    reviewer_client=None means: no Reviewer node at all.
+    reviewer_client=None means no Reviewer node; narrator_client=None means no
+    Narrator node.
     """
 
     def planner_node(state: AnalysisState) -> dict:
@@ -179,7 +190,7 @@ def build_graph(client: LLMClient, reviewer_client: LLMClient | None = None):
             }
         return {"critic": report}
 
-    def reviewer_node(state: AnalysisState) -> dict:  # NEW (Phase 10)
+    def reviewer_node(state: AnalysisState) -> dict:
         try:
             verdict = review_result(
                 state["question"], state["plan"], state["result"], reviewer_client
@@ -200,6 +211,22 @@ def build_graph(client: LLMClient, reviewer_client: LLMClient | None = None):
         text = build_report(state["plan"], state["result"], state["critic"])
         return {"status": "success", "message": text}
 
+    def narrator_node(state: AnalysisState) -> dict:  # NEW (Phase 11)
+        review = state.get("review")
+        if review is not None and review.verdict == "mismatch":
+            return {
+                "narrative": None,
+                "narrative_error": "AI summary skipped because the reviewer flagged a possible mismatch.",
+            }
+        try:
+            text = narrate_result(
+                state["question"], state["plan"], state["result"], narrator_client
+            )
+        except (LLMError, NarrationError) as exc:
+            # The template report in `message` is still there, so nothing is lost.
+            return {"narrative": None, "narrative_error": str(exc)}
+        return {"narrative": text, "narrative_error": None}
+
     graph = StateGraph(AnalysisState)
     graph.add_node("planner", planner_node)
     graph.add_node("executor", executor_node)
@@ -214,7 +241,7 @@ def build_graph(client: LLMClient, reviewer_client: LLMClient | None = None):
 
     if reviewer_client is None:
         graph.add_conditional_edges("critic", route_after_critic, ["reporter", "fail"])
-    else:  # NEW (Phase 10)
+    else:
         graph.add_node("reviewer", reviewer_node)
         # path map: the router still returns "reporter"; we send it to the reviewer first.
         graph.add_conditional_edges(
@@ -223,7 +250,12 @@ def build_graph(client: LLMClient, reviewer_client: LLMClient | None = None):
         graph.add_conditional_edges("reviewer", route_after_reviewer, ["reporter", "repair"])
 
     graph.add_edge("repair", "planner")
-    graph.add_edge("reporter", END)
+    if narrator_client is None:  # NEW (Phase 11)
+        graph.add_edge("reporter", END)
+    else:
+        graph.add_node("narrator", narrator_node)
+        graph.add_edge("reporter", "narrator")
+        graph.add_edge("narrator", END)
     graph.add_edge("fail", END)
     return graph.compile()
 
@@ -233,11 +265,12 @@ def run_analysis(
     df: pd.DataFrame,
     client: LLMClient,
     reviewer_client: LLMClient | None = None,
+    narrator_client: LLMClient | None = None,  # NEW (Phase 11)
 ) -> AnalysisOutcome:
     """Run the whole workflow. Never raises: failures become status='failed'."""
     initial: AnalysisState = {"question": question, "df": df, "repair_attempts": 0}
     try:
-        final = build_graph(client, reviewer_client).invoke(
+        final = build_graph(client, reviewer_client, narrator_client).invoke(
             initial, config={"recursion_limit": RECURSION_LIMIT}
         )
     except Exception as exc:  # last-resort boundary; only the type is shown
@@ -247,10 +280,16 @@ def run_analysis(
         )
 
     review = final.get("review")
-    if review is not None:  # NEW (Phase 10): reviewer text is LLM text, so escape it
+    if review is not None:  # reviewer text is LLM text, so escape it
         review = review.model_copy(
             update={"reason": escape_markdown(review.reason, MAX_MESSAGE_CHARS)}
         )
+    narrative = final.get("narrative")  # NEW (Phase 11): LLM text, so escape it too
+    if narrative is not None:
+        narrative = escape_markdown(narrative, MAX_ANSWER_CHARS)
+    narrative_error = final.get("narrative_error")
+    if narrative_error is not None:
+        narrative_error = escape_markdown(narrative_error, MAX_MESSAGE_CHARS)
     return AnalysisOutcome(
         status=final.get("status", "failed"),
         message=final.get("message", "The analysis failed."),
@@ -260,4 +299,6 @@ def run_analysis(
         repair_attempts=final.get("repair_attempts", 0),
         review=review,
         review_error=final.get("review_error"),
+        narrative=narrative,
+        narrative_error=narrative_error,
     )

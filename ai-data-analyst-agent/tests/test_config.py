@@ -72,3 +72,23 @@ def test_reviewer_can_be_disabled(value):
 def test_invalid_reviewer_flag_raises_config_error():
     with pytest.raises(ConfigError, match="ENABLE_REVIEWER"):
         load_settings({"ENABLE_REVIEWER": "maybe"})
+
+def test_narrator_defaults():
+    settings = load_settings({"GROQ_MODEL": "main-model"})
+    assert settings.narrator_enabled is True
+    assert settings.narrator_model == "main-model"
+
+
+def test_narrator_model_can_be_overridden():
+    settings = load_settings({"GROQ_MODEL": "main", "GROQ_NARRATOR_MODEL": "writer"})
+    assert settings.narrator_model == "writer"
+
+
+@pytest.mark.parametrize("value", ["false", "0", "no", "False"])
+def test_narrator_can_be_disabled(value):
+    assert load_settings({"ENABLE_NARRATOR": value}).narrator_enabled is False
+
+
+def test_invalid_narrator_flag_raises_config_error():
+    with pytest.raises(ConfigError, match="ENABLE_NARRATOR"):
+        load_settings({"ENABLE_NARRATOR": "maybe"})
