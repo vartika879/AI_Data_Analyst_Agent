@@ -27,6 +27,10 @@ with st.sidebar:
         st.success("Groq API key: configured")
     else:
         st.warning("Groq API key: not set (add it to your .env file)")
+    if settings.reviewer_enabled:
+        st.write(f"Reviewer agent: on (`{settings.reviewer_model}`)")
+    else:
+        st.write("Reviewer agent: off")
 
 
 def render_outcome(outcome: AnalysisOutcome) -> None:
@@ -49,6 +53,15 @@ def render_outcome(outcome: AnalysisOutcome) -> None:
     if outcome.repair_attempts:
         st.caption("The first plan was rejected, so one automatic repair attempt was made.")
 
+    review = outcome.review
+    if review is not None and review.verdict == "mismatch":
+        st.warning(f"Reviewer (AI opinion): this may not answer your question. {review.reason}")
+    elif review is not None and review.verdict == "partial":
+        st.warning(f"Reviewer (AI opinion): this may only partly answer your question. {review.reason}")
+    elif review is not None:
+        st.caption(f"Reviewer (AI opinion): looks like it answers the question. {review.reason}")
+    elif outcome.review_error:
+        st.caption(f"Reviewer unavailable: {outcome.review_error}")
     if outcome.plan is not None:
         with st.expander("How this was computed (analysis plan)"):
             st.json(outcome.plan.model_dump(mode="json"))
@@ -104,12 +117,17 @@ if st.button("Analyze", type="primary"):
         st.stop()
     try:
         client = GroqClient(settings.groq_api_key, settings.groq_model)
+        reviewer_client = (
+            GroqClient(settings.groq_api_key, settings.reviewer_model)
+            if settings.reviewer_enabled
+            else None
+        )
     except LLMError as exc:
         st.error(str(exc))
         st.stop()
 
     with st.spinner("Planning, running and checking..."):
-        outcome = run_analysis(question, df, client)
+        outcome = run_analysis(question, df, client, reviewer_client)
     st.session_state["saved"] = {"question": question, "outcome": outcome}
 
 # Rendered from session_state, so the answer survives reruns (e.g. typing in a widget).

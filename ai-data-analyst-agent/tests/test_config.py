@@ -51,3 +51,24 @@ def test_repr_does_not_leak_api_key():
     settings = load_settings({"GROQ_API_KEY": "super-secret-key"})
     assert "super-secret-key" not in repr(settings)
     assert "super-secret-key" not in str(settings)
+
+
+def test_reviewer_defaults():
+    settings = load_settings({"GROQ_MODEL": "main-model"})
+    assert settings.reviewer_enabled is True
+    assert settings.reviewer_model == "main-model"
+
+
+def test_reviewer_model_can_be_overridden():
+    settings = load_settings({"GROQ_MODEL": "main", "GROQ_REVIEWER_MODEL": "cheap"})
+    assert settings.reviewer_model == "cheap"
+
+
+@pytest.mark.parametrize("value", ["false", "0", "no", "False"])
+def test_reviewer_can_be_disabled(value):
+    assert load_settings({"ENABLE_REVIEWER": value}).reviewer_enabled is False
+
+
+def test_invalid_reviewer_flag_raises_config_error():
+    with pytest.raises(ConfigError, match="ENABLE_REVIEWER"):
+        load_settings({"ENABLE_REVIEWER": "maybe"})

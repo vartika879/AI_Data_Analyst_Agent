@@ -88,13 +88,14 @@ tests/                pytest suite
 - Cell values and LLM text are escaped before being shown as markdown or in
   chart labels.
 - Uploaded data lives in memory for the session only.
-
 ## Privacy
 
 To plan a question, the app sends the **column names, types, missing counts
 and up to 5 sample values per column** (40 characters each) to Groq's API.
-The full file is not sent. Do not use sensitive data you are not allowed to
-share with that provider.
+If the Reviewer agent is on, it also sends the question, the plan and the
+**first 10 rows of the result** (40 characters per cell). The full file is not
+sent. Do not use sensitive data you are not allowed to share with that
+provider. Set `ENABLE_REVIEWER=false` to stop sending result rows.
 
 ## Known limitations
 
