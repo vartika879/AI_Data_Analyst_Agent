@@ -18,6 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 
 from analyst.executor import ExecutionResult
 from analyst.llm import LLMClient
+from analyst.privacy import PrivacyPolicy
 from analyst.planner import PlannerError, _extract_json_text
 from analyst.reviewer import MAX_CELL_CHARS, MAX_REVIEW_ROWS, _cell
 from analyst.schemas import AnalysisPlan
@@ -188,9 +189,16 @@ def build_narration_prompt(question: str, plan: AnalysisPlan, result: ExecutionR
 
 
 def narrate_result(
-    question: str, plan: AnalysisPlan, result: ExecutionResult, client: LLMClient
+    question: str,
+    plan: AnalysisPlan,
+    result: ExecutionResult,
+    client: LLMClient,
+    policy: PrivacyPolicy | None = None,
 ) -> str:
     """Ask the Narrator. Raises NarrationError, or LLMError if the API fails."""
+    if policy is not None and not policy.rows_allowed:
+        # The Narrator needs result rows, so privacy mode switches it off.
+        raise NarrationError("The AI summary is off in privacy mode.")
     raw = client.complete_json(NARRATOR_SYSTEM_PROMPT, build_narration_prompt(question, plan, result))
     try:
         json_text = _extract_json_text(raw)

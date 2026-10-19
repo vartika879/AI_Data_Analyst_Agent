@@ -82,6 +82,15 @@ def _coerce_value(series: pd.Series, column: str, value):
     )
 
 
+def _normalise_text(series: pd.Series) -> pd.Series:
+    """Text compared without caring about case or surrounding spaces ("pen" == "Pen ")."""
+    return series.astype("string").str.strip().str.casefold()
+
+
+def _is_text_column(series: pd.Series) -> bool:
+    return not is_numeric_dtype(series) and not is_bool_dtype(series)
+
+
 def _build_mask(df: pd.DataFrame, cond: FilterCondition) -> pd.Series:
     series = df[cond.column]
     op = cond.operator
@@ -97,9 +106,17 @@ def _build_mask(df: pd.DataFrame, cond: FilterCondition) -> pd.Series:
         return ORDERING_FUNCS[op](series, cond.value)
     if op == "in":
         values = [_coerce_value(series, cond.column, v) for v in cond.value]
+        if _is_text_column(series):
+            wanted = [v.strip().casefold() for v in values]
+            return _normalise_text(series).isin(wanted).fillna(False).astype(bool)
         return series.isin(values)
 
     value = _coerce_value(series, cond.column, cond.value)
+    if op in ("==", "!=") and _is_text_column(series):
+        # Users (and the Planner in privacy mode, which sees no sample values) write
+        # "pen" for "Pen". An exact match would silently return 0 rows.
+        equal = (_normalise_text(series) == value.strip().casefold()).fillna(False).astype(bool)
+        return equal if op == "==" else ~equal  # missing values count as "not equal"
     if op == "==":
         return series == value
     if op == "!=":

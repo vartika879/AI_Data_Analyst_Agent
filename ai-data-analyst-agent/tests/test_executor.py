@@ -326,3 +326,32 @@ def test_plan_with_unknown_column_is_rejected_before_running(df):
 def test_unsupported_plan_is_rejected(df):
     with pytest.raises(PlanValidationError, match="Unsupported"):
         run(df, operation="unsupported", unsupported_reason="Needs forecasting.")
+
+
+def test_text_equality_ignores_case_and_spaces(df):
+    lower = run(df, operation="filter", filters=[cond("city", "==", "x")])
+    assert lower.table["name"].tolist() == ["Asha", "Charu"]
+    spaced = run(df, operation="filter", filters=[cond("city", "==", " X ")])
+    assert spaced.table["name"].tolist() == ["Asha", "Charu"]
+
+
+def test_text_not_equal_ignores_case_and_keeps_missing(df):
+    result = run(df, operation="filter", filters=[cond("city", "!=", "x")])
+    assert result.table["name"].tolist() == ["Ravi", "Dev"]  # Dev has no city
+
+
+def test_text_in_ignores_case(df):
+    result = run(df, operation="filter", filters=[cond("city", "in", ["x", "y"])])
+    assert len(result.table) == 3
+
+
+def test_aggregate_with_lowercase_filter_value_uses_the_rows():
+    data = pd.DataFrame({"product": ["Pen", "Book", "Pen"], "net": [90, 230, 180]})
+    result = run(
+        data,
+        operation="aggregate",
+        filters=[cond("product", "==", "pen")],
+        aggregations=[{"function": "sum", "column": "net"}],
+    )
+    assert result.rows_after_filters == 2
+    assert result.table["net_sum"].tolist() == [270]

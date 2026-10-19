@@ -113,3 +113,20 @@ def test_clarifier_can_be_disabled(value):
 def test_invalid_clarifier_flag_raises_config_error():
     with pytest.raises(ConfigError, match="ENABLE_CLARIFIER"):
         load_settings({"ENABLE_CLARIFIER": "maybe"})
+
+def test_privacy_mode_defaults_to_strict():
+    assert load_settings({}).privacy_mode == "strict"
+
+
+def test_privacy_mode_can_be_standard():
+    assert load_settings({"PRIVACY_MODE": "standard"}).privacy_mode == "standard"
+
+
+def test_invalid_privacy_mode_is_rejected():
+    with pytest.raises(ConfigError, match="PRIVACY_MODE"):
+        load_settings({"PRIVACY_MODE": "disabled"})
+
+
+def test_legacy_boolean_privacy_values_map_to_modes():
+    assert load_settings({"PRIVACY_MODE": "true"}).privacy_mode == "strict"
+    assert load_settings({"PRIVACY_MODE": "false"}).privacy_mode == "standard"

@@ -12,10 +12,12 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 
-from analyst.config import load_settings
+from analyst.config import ConfigError, load_settings
 from analyst.data_loader import load_csv
 from analyst.graph import run_analysis
-from analyst.llm import GroqClient, LLMClient
+from analyst.llm import LLMClient
+from analyst.providers import describe, make_client, missing_key_message
+from analyst.privacy import PrivacyPolicy
 from evals.cases import CASES, EvalCase
 from evals.dataset import csv_bytes
 from evals.scoring import check_outcome
@@ -27,7 +29,21 @@ CONFIGS: dict[str, frozenset[str]] = {
     "reviewer": frozenset({"reviewer"}),
     "narrator": frozenset({"narrator"}),
     "full": frozenset(ROLES),
+    # Privacy mode: no sample values / result rows to the LLM; the Narrator is skipped.
+    "private": frozenset({"clarifier", "reviewer"}),
 }
+PRIVATE_CONFIGS = {"private"}
+
+
+def _retry_count(client) -> int:
+    """Times a request was tried again inside this client (RetryingClient, also inside a fallback)."""
+    own = getattr(client, "retries", 0)
+    total = own if isinstance(own, int) else 0
+    for attr in ("_primary", "_fallback"):
+        inner = getattr(client, attr, None)
+        if inner is not None:
+            total += _retry_count(inner)
+    return total
 
 
 class CountingClient:
@@ -37,6 +53,10 @@ class CountingClient:
         self._inner = inner
         self.calls = 0
         self.seconds = 0.0
+
+    @property
+    def retries(self) -> int:
+        return _retry_count(self._inner)
 
     def complete_json(self, system_prompt: str, user_prompt: str) -> str:
         start = time.perf_counter()
@@ -62,7 +82,10 @@ class CaseRecord:
     review_verdict: str | None = None
     narrative_ok: bool = False
     narrative_error: str | None = None
+    clarify_error: str | None = None
+    review_error: str | None = None
     llm_calls: int = 0
+    llm_retries: int = 0  # extra tries after temporary errors; real API requests = calls + retries
     llm_seconds: float = 0.0
     wall_seconds: float = 0.0
 
@@ -81,6 +104,7 @@ def run_case(
         reviewer_client=helpers.get("reviewer"),
         narrator_client=helpers.get("narrator"),
         clarifier_client=helpers.get("clarifier"),
+        policy=PrivacyPolicy.strict() if config in PRIVATE_CONFIGS else None,
     )
     wall = time.perf_counter() - start
 
@@ -100,7 +124,10 @@ def run_case(
         review_verdict=outcome.review.verdict if outcome.review else None,
         narrative_ok=outcome.narrative is not None,
         narrative_error=(outcome.narrative_error or "")[:120] or None,
+        clarify_error=(outcome.clarify_error or "")[:120] or None,
+        review_error=(outcome.review_error or "")[:120] or None,
         llm_calls=sum(c.calls for c in clients),
+        llm_retries=sum(c.retries for c in clients),
         llm_seconds=sum(c.seconds for c in clients),
         wall_seconds=wall,
     )
@@ -236,35 +263,40 @@ def main(argv=None) -> int:
     if args.repeats < 1:
         parser.error("--repeats must be at least 1")
 
-    settings = load_settings()
-    if not settings.has_api_key:
-        print("GROQ_API_KEY is not set. Add it to your .env file.")
+    try:
+        settings = load_settings()
+    except ConfigError as exc:
+        print(f"Configuration problem: {exc}")
+        return 1
+    needed_roles = {"planner"}.union(*(set(CONFIGS[n]) for n in names))
+    key_problem = missing_key_message(settings, sorted(needed_roles))
+    if key_problem:
+        print(key_problem)
         return 1
 
     cases = CASES[: args.limit] if args.limit else CASES
     df = load_csv(csv_bytes(), "eval.csv", settings.max_upload_bytes)
-    models = {
-        "planner": settings.groq_model,
-        "clarifier": settings.clarifier_model,
-        "reviewer": settings.reviewer_model,
-        "narrator": settings.narrator_model,
-    }
+    models = {role: describe(settings, role) for role in ("planner", "clarifier", "reviewer", "narrator")}
 
     def factory(role: str) -> LLMClient:
-        return GroqClient(settings.groq_api_key, models[role])
+        return make_client(settings, role)
 
     estimate = sum(
         sum(1 + len(CONFIGS[n]) for c in cases if not (c.kind == "ambiguous" and "clarifier" not in CONFIGS[n]))
         for n in names
     ) * args.repeats
     print(f"Models: {models}")
-    print(f"About {estimate} LLM calls (more if repairs happen). Check your Groq rate limits.\n")
+    print(f"About {estimate} LLM calls (more if repairs happen). Check your providers' rate limits.\n")
 
     summaries, all_records = {}, []
     for name in names:
         def show(record: CaseRecord, name=name) -> None:
             mark = "PASS" if record.passed else "FAIL"
             extra = "" if record.passed else f"  ({record.reason})"
+            if record.clarify_error:
+                extra += f"  [clarifier error: {record.clarify_error}]"
+            if record.review_error:
+                extra += f"  [reviewer error: {record.review_error}]"
             print(f"[{name}] {record.case_id:<22} {mark}{extra}", flush=True)
 
         records = run_config(name, cases, df, factory, args.delay, args.repeats, show)
@@ -272,6 +304,15 @@ def main(argv=None) -> int:
         all_records += records
 
     print("\n" + format_report(summaries))
+    retried = sum(r.llm_retries for r in all_records)
+    if retried:
+        print(f"Note: {retried} request(s) were tried again after a temporary error "
+              "(rate limit, timeout, ...). Real API requests = calls + retries.")
+    for helper, attr in (("clarifier", "clarify_error"), ("reviewer", "review_error")):
+        bad = sum(1 for r in all_records if getattr(r, attr))
+        if bad:
+            print(f"WARNING: the {helper} agent failed in {bad} case(s). Its results are not trustworthy: "
+                  "run  python -m evals.check_providers")
 
     out_dir = Path("evals/results")
     out_dir.mkdir(parents=True, exist_ok=True)

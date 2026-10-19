@@ -12,6 +12,7 @@ import pandas as pd
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from analyst.llm import LLMClient
+from analyst.privacy import PrivacyPolicy, ensure_no_hidden_mentions
 from analyst.planner import (
     MAX_QUESTION_CHARS,
     PlannerError,
@@ -36,6 +37,15 @@ Output ONE JSON object only (no markdown, no explanation):
 - Clear enough:  {"action": "proceed"}
 - Ambiguous:     {"action": "ask", "question": "<one short question>",
                   "options": ["<option 1>", "<option 2>"]}
+
+What the tool CAN do (one table only): column summary, filter, sort, aggregate
+(sum, mean, median, min, max, count, nunique, row count, optionally grouped),
+missing values, correlation, and a simple bar/line/scatter chart.
+What it CANNOT do: predictions or forecasting, joins or merges with other files
+or tables, date arithmetic, changing the data, or knowledge from outside the file.
+If the question needs something the tool CANNOT do, ALWAYS answer
+{"action": "proceed"}. Never ask about it: the next step tells the user it is
+not supported. Missing files or tables are not an ambiguity to clarify.
 
 Ask ONLY when:
 - the question refers to something that matches 2 or more columns equally well
@@ -102,16 +112,26 @@ class ClarifierDecision(BaseModel):
         return self
 
 
-def build_clarifier_prompt(question: str, df: pd.DataFrame) -> str:
+def build_clarifier_prompt(
+    question: str, df: pd.DataFrame, policy: PrivacyPolicy | None = None
+) -> str:
+    ensure_no_hidden_mentions(question, policy)  # before anything is built for the LLM
     # json.dumps escapes quotes, so a cell value cannot break out of its field.
     return json.dumps(
-        {"dataset": describe_dataframe(df), "question": question}, ensure_ascii=False
+        {"dataset": describe_dataframe(df, policy), "question": question}, ensure_ascii=False
     )
 
 
-def decide_clarification(question: str, df: pd.DataFrame, client: LLMClient) -> ClarifierDecision:
+def decide_clarification(
+    question: str,
+    df: pd.DataFrame,
+    client: LLMClient,
+    policy: PrivacyPolicy | None = None,
+) -> ClarifierDecision:
     """Ask the Clarifier. Raises ClarificationError, or LLMError if the API fails."""
-    raw = client.complete_json(CLARIFIER_SYSTEM_PROMPT, build_clarifier_prompt(question, df))
+    raw = client.complete_json(
+        CLARIFIER_SYSTEM_PROMPT, build_clarifier_prompt(question, df, policy)
+    )
     try:
         json_text = _extract_json_text(raw)
     except PlannerError:

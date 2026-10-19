@@ -183,6 +183,12 @@ def review_execution(
             "The result is empty: no rows matched. Check the spelling and "
             "capitalisation of the values you filtered on."
         )
+    if must_have_rows and plan.filters and result.rows_after_filters == 0 and len(df) > 0:
+        # e.g. "net revenue of X" gives a sum of 0 that looks like a real answer.
+        warnings.append(
+            "The filter matched 0 rows, so this result is based on no data. "
+            "Check the spelling of the values you filtered on."
+        )
 
     return CriticReport(
         passed=not issues,

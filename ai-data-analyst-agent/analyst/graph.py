@@ -26,6 +26,13 @@ from analyst.executor import ExecutionError, ExecutionResult, execute_plan
 from analyst.llm import LLMClient, LLMError
 from analyst.narrator import MAX_ANSWER_CHARS, NarrationError, narrate_result
 from analyst.plan_validation import PlanValidationError
+from analyst.privacy import (
+    HiddenColumnError,
+    PrivacyPolicy,
+    find_hidden_mentions,
+    hidden_columns_used,
+    tracing_disabled,
+)
 from analyst.planner import MAX_QUESTION_CHARS, PlannerError, generate_plan
 from analyst.reporter import _escape as escape_markdown
 from analyst.reporter import build_report
@@ -138,6 +145,15 @@ def prepare_repair(state: AnalysisState) -> dict:
     }
 
 
+def _hidden_question_message(columns: list[str]) -> str:
+    """Shown on the user's own screen only. It is never sent to the LLM."""
+    return (
+        "Your question names column(s) you hid from the AI: "
+        + ", ".join(columns)
+        + ". The question was not sent. Unhide the column(s), or ask without naming them."
+    )
+
+
 def fail_node(state: AnalysisState) -> dict:
     text = state.get("error") or "The analysis failed."
     if state.get("repair_attempts", 0) > 0:
@@ -151,11 +167,31 @@ def build_graph(
     reviewer_client: LLMClient | None = None,
     narrator_client: LLMClient | None = None,
     clarifier_client: LLMClient | None = None,  # NEW (Phase 12)
+    policy: PrivacyPolicy | None = None,  # NEW (privacy mode)
 ):
     """Build and compile the workflow. LLM clients are injected (testable).
 
     A client of None means that agent's node is not part of the graph at all.
+    With a strict privacy policy the Narrator is dropped: it needs result rows.
     """
+    if policy is not None and not policy.rows_allowed:
+        narrator_client = None
+
+    def guard_node(state: AnalysisState) -> dict:
+        """First node when columns are hidden: reject a question that names one.
+
+        Runs locally, before any LLM call, so nothing is sent.
+        """
+        found = find_hidden_mentions(state["question"], policy.hidden_columns)
+        if not found:
+            return {}
+        return {
+            "status": "failed",
+            "message": escape_markdown(_hidden_question_message(found), MAX_MESSAGE_CHARS),
+        }
+
+    def route_after_guard(state: AnalysisState) -> str:
+        return END if state.get("status") == "failed" else entry
 
     def clarifier_node(state: AnalysisState) -> dict:  # NEW (Phase 12)
         question = state["question"].strip()
@@ -163,7 +199,9 @@ def build_graph(
             # The planner reports these problems with a clearer message.
             return {"clarify_error": None}
         try:
-            decision = decide_clarification(question, state["df"], clarifier_client)
+            decision = decide_clarification(
+                question, state["df"], clarifier_client, policy
+            )
         except (LLMError, ClarificationError) as exc:
             # Fail open: a broken Clarifier must never block the question.
             return {"clarify_error": str(exc)}
@@ -183,6 +221,7 @@ def build_graph(
                 state["df"],
                 client,
                 feedback=state.get("repair_feedback"),
+                policy=policy,
             )
         except PlannerError as exc:
             # `detail` is only set when the LLM output was malformed. Question
@@ -196,6 +235,17 @@ def build_graph(
         except LLMError as exc:
             return {"error": str(exc), "error_kind": "fatal"}
 
+        hidden = hidden_columns_used(plan, policy) if policy is not None else []
+        if hidden:
+            # The AI guessed a hidden column from the question. Do not run it.
+            return {
+                "error": "This question needs columns you hid from the AI: "
+                + ", ".join(hidden)
+                + ". Unhide them or ask about other columns.",
+                "error_detail": "The plan used a column that is not available. "
+                "Use only the columns in the dataset, or return unsupported.",
+                "error_kind": "recoverable",
+            }
         if not plan.is_supported:
             reason = escape_markdown(plan.unsupported_reason or "", MAX_MESSAGE_CHARS)
             return {
@@ -209,9 +259,11 @@ def build_graph(
         try:
             result = execute_plan(state["plan"], state["df"])
         except (PlanValidationError, ExecutionError) as exc:
+            # The detail goes back to the LLM, so hidden column names are removed.
+            detail = policy.redact(str(exc)) if policy is not None else str(exc)
             return {
                 "error": str(exc),
-                "error_detail": str(exc),
+                "error_detail": detail,
                 "error_kind": "recoverable",
             }
         return {"result": result}
@@ -229,7 +281,7 @@ def build_graph(
     def reviewer_node(state: AnalysisState) -> dict:
         try:
             verdict = review_result(
-                state["question"], state["plan"], state["result"], reviewer_client
+                state["question"], state["plan"], state["result"], reviewer_client, policy
             )
         except (LLMError, ReviewError) as exc:
             # Advisory agent: its failure never blocks the answer.
@@ -271,12 +323,16 @@ def build_graph(
     graph.add_node("repair", prepare_repair)
     graph.add_node("fail", fail_node)
 
-    if clarifier_client is None:  # NEW (Phase 12)
-        graph.add_edge(START, "planner")
-    else:
+    entry = "planner" if clarifier_client is None else "clarifier"
+    if clarifier_client is not None:  # NEW (Phase 12)
         graph.add_node("clarifier", clarifier_node)
-        graph.add_edge(START, "clarifier")
         graph.add_conditional_edges("clarifier", route_after_clarifier, ["planner", END])
+    if policy is not None and policy.hidden_columns:
+        graph.add_node("guard", guard_node)
+        graph.add_edge(START, "guard")
+        graph.add_conditional_edges("guard", route_after_guard, [entry, END])
+    else:
+        graph.add_edge(START, entry)
 
     graph.add_conditional_edges("planner", route_after_planner, ["executor", "repair", "fail", END])
     graph.add_conditional_edges("executor", route_after_executor, ["critic", "repair", "fail"])
@@ -309,12 +365,19 @@ def run_analysis(
     reviewer_client: LLMClient | None = None,
     narrator_client: LLMClient | None = None,
     clarifier_client: LLMClient | None = None,  # NEW (Phase 12)
+    policy: PrivacyPolicy | None = None,  # NEW (privacy mode)
 ) -> AnalysisOutcome:
     """Run the whole workflow. Never raises: failures become status='failed'."""
     initial: AnalysisState = {"question": question, "df": df, "repair_attempts": 0}
     try:
-        final = build_graph(client, reviewer_client, narrator_client, clarifier_client).invoke(
-            initial, config={"recursion_limit": RECURSION_LIMIT}
+        with tracing_disabled(policy):  # LangSmith could otherwise receive the DataFrame
+            final = build_graph(
+                client, reviewer_client, narrator_client, clarifier_client, policy
+            ).invoke(initial, config={"recursion_limit": RECURSION_LIMIT})
+    except HiddenColumnError as exc:  # safety net: a lower-level guard fired
+        return AnalysisOutcome(
+            status="failed",
+            message=escape_markdown(_hidden_question_message(list(exc.columns)), MAX_MESSAGE_CHARS),
         )
     except Exception as exc:  # last-resort boundary; only the type is shown
         return AnalysisOutcome(

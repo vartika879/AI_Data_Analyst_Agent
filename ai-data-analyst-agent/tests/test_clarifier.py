@@ -150,3 +150,14 @@ def test_combine_question_trims_a_long_original_but_keeps_the_option():
     combined = combine_question("x" * MAX_QUESTION_CHARS, "use net_revenue")
     assert len(combined) <= MAX_QUESTION_CHARS
     assert combined.endswith("Clarification: use net_revenue")
+
+
+def test_prompt_lists_unsupported_and_says_proceed():
+    # The Clarifier must know the tool's limits, or it asks about unsupported questions.
+    from analyst.clarifier import CLARIFIER_SYSTEM_PROMPT as prompt
+
+    lowered = prompt.lower()
+    assert "cannot do" in lowered
+    assert "forecasting" in lowered
+    assert "joins" in lowered
+    assert '"action": "proceed"' in prompt

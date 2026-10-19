@@ -151,3 +151,14 @@ def test_impossible_missing_count_is_caught(df):
     tampered = result.table.assign(missing_count=999)
     report = review_execution(plan, replace(result, table=tampered), df)
     assert any("more missing values" in i for i in report.issues)
+
+
+def test_ungrouped_aggregate_on_zero_matching_rows_warns(df):
+    _, _, report = run_and_review(
+        df,
+        operation="aggregate",
+        filters=[{"column": "city", "operator": "==", "value": "Nowhere"}],
+        aggregations=[{"function": "sum", "column": "salary"}],
+    )
+    assert report.passed
+    assert any("matched 0 rows" in w for w in report.warnings)
