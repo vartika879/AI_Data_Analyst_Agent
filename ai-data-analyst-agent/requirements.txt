@@ -6,3 +6,5 @@ groq>=0.30
 langgraph>=0.4
 plotly>=5.20
 pytest>=8.0
+
+openai>=1.40
