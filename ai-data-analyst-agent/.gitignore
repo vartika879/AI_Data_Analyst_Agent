@@ -5,5 +5,8 @@ __pycache__/
 *.pyc
 test.csv
 empty.csv
+check.ipynb
 
-evals/results/
+# keep only the final eval result referenced in the README
+evals/results/*
+!evals/results/eval_20261019_132522.json

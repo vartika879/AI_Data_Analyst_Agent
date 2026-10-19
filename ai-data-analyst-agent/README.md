@@ -1,136 +1,90 @@
 # AI Data Analyst Agent
 
-Upload a CSV, ask a question in plain English, and get a data-backed answer,
-a result table and (optionally) a chart.
+Upload a CSV, ask a question in plain language, get a table, a chart and a short written answer.
+The LLM never writes code. It only picks an operation from a fixed list, and my own
+Pandas functions do the real calculation.
 
-Built to learn LangGraph and agentic patterns, with safety as a design goal:
-**the LLM never writes or runs code.** It only fills in a structured plan.
+> **Live demo:** _add your Streamlit link here_ (limited to 10 analyses per session)
+>
+> Add screenshots here, e.g. `![demo](docs/demo.png)`
 
 ## How it works
 
 ```
-question ──> Planner ──> Executor ──> Critic ──> Reporter ──> answer + table + chart
-              (LLM)      (fixed       (checks)    (template,
-                          Pandas)                  no LLM)
-                 ^            |
-                 └── repair ──┘   (at most one attempt, recoverable errors only)
+question -> [Clarifier] -> Planner -> Executor -> Critic -> [Reviewer] -> Reporter -> [Narrator]
 ```
 
-1. **Planner** (Groq LLM): turns the question into an `AnalysisPlan` (Pydantic).
-   Output that does not match the schema is rejected.
-2. **Executor**: runs the plan with pre-written Pandas functions chosen from a
-   whitelist. No `exec`, no `eval`. Plans are validated against the real
-   columns and dtypes first.
-3. **Critic**: re-checks what can be verified (result shape, row counts,
-   sort order, filters, correlation range). It catches internal
-   inconsistencies. **It does not guarantee the answer is correct** or that
-   the question was understood as you meant it.
-4. **Reporter**: writes the answer from the computed table with a template, so
-   it cannot invent numbers.
+| Step | What it does | LLM? |
+|---|---|---|
+| Clarifier | Asks ONE question (with clickable options) if the question is truly ambiguous, e.g. "revenue" when both `gross_revenue` and `net_revenue` exist | yes |
+| Planner | Turns the question into a small JSON plan (`aggregate`, `filter`, `sort`, `correlation`, ...) or says it is `unsupported` | yes |
+| Executor | Runs the validated plan with fixed, pre-written Pandas code. No `exec`/`eval` | no |
+| Critic | Re-checks facts about the result (row counts, sort order, filters) | no |
+| Reviewer | Judges whether the result answers the question. Advisory, can trigger one repair | yes |
+| Reporter | Builds the table, chart and template report | no |
+| Narrator | Writes a plain-language summary. It is dropped if any number in it cannot be traced to the data | yes |
 
-If the plan is rejected for a recoverable reason (unknown column, wrong value
-type, malformed LLM output), the problem is sent back to the Planner once.
-API failures and Critic failures are not retried.
+Built with LangGraph (workflow), Pydantic (plan validation), Pandas, Plotly and Streamlit.
+Each agent can use a different model and provider, with optional fallbacks and two API keys.
 
-An optional **Narrator** (LLM) writes a short summary. Every number in it is
-checked against the result data; if any number cannot be traced, the summary is
-discarded and the template report is shown. Wording is not verified.
+## Design choices
+
+- **No generated code.** Plans are validated, and operations and functions come from whitelists, so a prompt injection cannot run anything.
+- **Fail open and fail safe.** A broken Clarifier never blocks a question. A Narrator summary with an untraceable number is thrown away.
+- **Privacy mode.** Sends only column names and types (no sample values, no result rows), supports hidden columns, and rejects a question that names a hidden column before any LLM call. The calculation always runs locally. Limits: the question text is sent as typed, and hidden-column detection matches names only, not synonyms.
+- **One repair budget** shared by the Critic, Reviewer and planner errors.
 
 ## Supported operations
 
-Column summary, filtering, sorting, grouping + aggregation (sum, mean, median,
-min, max, count, nunique, row count), missing-value analysis, correlation.
-Charts (bar, line, scatter) for grouped aggregations; bar for missing values.
+Column summary, filter, sort, aggregate (sum, mean, median, min, max, count, nunique, row count, with optional group by), missing values, correlation, and bar/line/scatter charts on one table.
+Not supported: forecasting, joins with other files, date arithmetic, changing data, outside knowledge.
 
-## Setup (Windows PowerShell)
+## Evaluation
 
-```powershell
+A test set in `evals/` has 24 questions: answerable, unsupported and ambiguous.
+Final run (`--configs full --repeats 1`, 24 cases) with `gpt-oss-120b` as planner and `gpt-oss-20b` for the other agents, via Groq:
+
+| Metric | Result |
+|---|---|
+| Answerable questions correct | 20/20 |
+| Unsupported correctly refused | 2/2 |
+| Ambiguous questions correctly clarified | 2/2 |
+| Unnecessary clarification questions | 0 |
+| Reviewer agreed with the result | 20/20 |
+| Narrator summaries accepted | 20/20 |
+| LLM calls / time per case | 3.6 calls, 2.8 s |
+
+**Bug found by the eval:** early runs had the Clarifier asking questions about unsupported requests ("predict next quarter", "join with customers file") instead of letting the Planner refuse them (0/6 unsupported). The Clarifier did not know the tool's limits. Telling it what the tool can and cannot do fixed it (6/6, no false asks).
+
+**Bug found by manual testing:** with Privacy mode on, the Planner sees no sample values, so "net revenue of pen" filtered on `pen` while the data says `Pen`. Text filters were case-sensitive, so 0 rows matched and the answer was a plausible-looking `0` (the real answer is 695). Fixes: text equality now ignores case and spaces, the Critic warns when a filter matches 0 rows, and the Planner prompt treats "X of Y" as one aggregated number. All three have unit tests.
+
+**Honest note:** a baseline with only the Planner also scored 100% on the answerable questions, so this test set is too easy to show that the Reviewer or Narrator improve accuracy. They add explanation and grounding checks, at about 3.5x the calls. Harder cases are the next step.
+
+## Run it
+
+```bash
 python -m venv .venv
-.\.venv\Scripts\Activate.ps1
+.venv\Scripts\activate            # macOS/Linux: source .venv/bin/activate
 pip install -r requirements.txt
-Copy-Item .env.example .env   # then edit .env and add your Groq API key
+copy .env.example .env            # then add GROQ_API_KEY
 streamlit run app.py
 ```
 
-Configuration (`.env`): `GROQ_API_KEY`, `GROQ_MODEL`, `MAX_UPLOAD_MB`.
-Model names change over time, so check Groq's current model list if you get a
-"model not found" error.
+Tests: `python -m pytest -q`
+Evals: `python -m evals.runner --configs baseline,full --repeats 3 --delay 10`
 
-## Tests
+## Limitations
 
-```powershell
-pytest -v
-```
-
-The tests never call the real API. The LLM is replaced by a scripted fake.
+- One table at a time, fixed list of operations.
+- Free-tier Groq limits apply per organization and per model, so a second key only helps if it comes from a different organization. The app retries temporary errors. On a heavy testing day the limit was hit (155 retries in one eval run) and the Clarifier and Reviewer became unavailable; the app then still answers the question using the Planner alone, but without clarification or review. Eval numbers above come from a clean run with no retries.
+- The Critic and Reviewer check consistency, not truth. The Reviewer is advisory.
+- Tested on a small synthetic sales dataset.
 
 ## Project layout
 
 ```
-analyst/
-  config.py           settings from environment variables
-  data_loader.py      CSV validation and loading
-  schemas.py          Pydantic plan schemas
-  plan_validation.py  plan vs. real DataFrame checks
-  executor.py         whitelisted Pandas operations
-  llm.py              Groq client wrapper
-  planner.py          question -> validated plan
-  critic.py           consistency checks
-  reporter.py         answer text from the result
-  charts.py           Plotly figures
-  graph.py            LangGraph workflow + repair
-app.py                Streamlit UI
-tests/                pytest suite
+analyst/   clarifier, planner, executor, critic, reviewer, narrator, reporter, graph, privacy, llm
+evals/     test cases, scoring, runner, provider check
+tests/     unit and end-to-end tests
+app.py     Streamlit UI
 ```
-
-## Security notes
-
-- API key comes from the environment only; it is never logged or shown, and
-  `Settings` hides it from `repr`.
-- No LLM-generated code is executed. Plans are limited to fixed choices.
-- `contains` filters are literal text, never regex.
-- Cell values and LLM text are escaped before being shown as markdown or in
-  chart labels.
-- Uploaded data lives in memory for the session only.
-## Privacy
-
-To plan a question, the app sends the **column names, types, missing counts
-and up to 5 sample values per column** (40 characters each) to Groq's API.
-If the Reviewer agent is on, it also sends the question, the plan and the
-**first 10 rows of the result** (40 characters per cell). The full file is not
-sent. Do not use sensitive data you are not allowed to share with that
-provider. Set `ENABLE_REVIEWER=false` to stop sending result rows.
-
-If the Narrator agent is on, it receives the same first 10 result rows. Set
-`ENABLE_NARRATOR=false` to stop that.
-
-## Known limitations
-
-- One CSV at a time; no joins.
-- Dates are treated as text.
-- Filters are combined with AND only. `!=` also matches missing values.
-- Results show at most 100 rows; charts at most 50 points.
-- The answer text is template-based, so it is plain rather than conversational.
-- The Planner can still misunderstand a question and produce a valid but
-  wrong plan. Check the "How this was computed" panel.
-- No authentication, database or deployment setup.
-
-## Evaluation
-
-`evals/` has 24 questions on a fixed synthetic sales CSV. Expected answers are
-computed with plain Python (`csv`, `statistics`), not Pandas, and the pipeline's
-result table is compared with them. Plans are not compared, because many
-different plans can be correct.
-
-```powershell
-python -m evals.runner --configs baseline,full --repeats 3 --delay 3
-```
-
-This makes real Groq API calls. `baseline` is the Planner alone; `full` adds the
-Clarifier, Reviewer and Narrator. Results are saved to `evals/results/`
-(ignored by Git). The harness itself is tested without any API
-(`tests/test_evals.py`): every case has a reference plan that must pass its own
-check.
-
-Limits: one small synthetic dataset, so a difference of one or two cases is
-noise. LLM output is not fully repeatable even at temperature 0.
